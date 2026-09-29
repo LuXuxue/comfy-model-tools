@@ -168,20 +168,23 @@ def cq_tensor(gs):
     return torch.tensor(list(json.dumps(cfg).encode("utf-8")), dtype=torch.uint8)
 
 @torch.no_grad()
-def quantize_w4a8(w, device="cuda"):
-    """W4A8 (asym_w4a8_int8): ConvRot-rotated int4 weight with a Lloyd-Max codebook + fp8 group
-    scales; activations quantize to int8 at runtime. Needs weight dim K divisible by 256 and N>=64.
+def quantize_w4a8(w, bits=4, group_size=None, device="cuda"):
+    """W4A8: ConvRot-rotated int4 weight with a Lloyd-Max codebook + fp8 group
+    scales, or with bits=6 W6A8: uniform int6, no codebook, ~3x lower weight error for
+    1.5x the bytes. Activations quantize to int8 at runtime. Needs K divisible by 256 and N>=64.
     Returns (out-tensor dict, comfy_quant cfg, relerr%)."""
     from comfy_kitchen.tensor import AsymW4A8Int8Layout, QuantizedTensor
+    group_size = group_size or (32 if bits == 6 else 16)
     wf = w.to(device, torch.bfloat16)
     q, p = AsymW4A8Int8Layout.quantize(
-        wf, group_size=16, convrot_groupsize=256,
-        scale_dtype=torch.float8_e4m3fn, codebook=True, stochastic_rounding=0)
+        wf, group_size=group_size, convrot_groupsize=256,
+        scale_dtype=torch.float8_e4m3fn, codebook=True, stochastic_rounding=0, bits=bits)
     deq = QuantizedTensor(q, "AsymW4A8Int8Layout", p).dequantize()
     tensors = {"weight": q.cpu(), "weight_s_rel": p.scale.cpu(), "weight_s_channel": p.s_channel.cpu()}
     if p.codebook is not None:
         tensors["weight_codebook"] = p.codebook.cpu()
-    cfg = {"format": "asym_w4a8_int8", "group_size": 16, "convrot": True, "convrot_groupsize": 256}
+    cfg = {"format": "w6a8_int8" if bits == 6 else "asym_w4a8_int8", "group_size": group_size,
+           "convrot": True, "convrot_groupsize": 256}
     relerr = ((deq.float() - wf.float()).norm() / wf.float().norm().clamp(min=1e-30)).item() * 100.0
     return tensors, cfg, relerr
 
@@ -211,10 +214,16 @@ def main():
     ap.add_argument("dst", nargs="?", help="output .safetensors; if omitted, derived from SRC by "
                     "replacing bf16/fp16/fp32 with int8_convrot (or appending _int8_convrot)")
     ap.add_argument("--dry-run", action="store_true", help="report the plan, write nothing")
-    ap.add_argument("--w4a8", action="store_true",
-                    help="quantize eligible block linears as W4A8 (asym_w4a8_int8: int4 weight + codebook "
-                         "+ fp8 scales, int8 activations) instead of int8. Layers with K not divisible by "
-                         "256 or N<64 fall back to int8; embeddings stay int8.")
+    fmt = ap.add_mutually_exclusive_group()
+    fmt.add_argument("--w4a8", action="store_true",
+                     help="quantize eligible block linears as W4A8 (int4 weight + codebook "
+                          "+ fp8 scales, int8 activations) instead of int8. Layers with K not divisible by "
+                          "256 or N<64 fall back to int8; embeddings stay int8.")
+    fmt.add_argument("--w6a8", action="store_true",
+                     help="like --w4a8 but uniform 6-bit weights: ~3x lower weight error than "
+                          "W4A8 at 0.78 vs 0.56 bytes/weight, same speed")
+    ap.add_argument("--group-size", type=int, default=None,
+                    help="columns per fp8 group scale for --w4a8/--w6a8 (default 16 for W4A8, 32 for W6A8)")
     ap.add_argument("--exclude", default=None, help="regex; matching layers are FORCED to passthrough")
     ap.add_argument("--include", default=None, help="regex; matching eligible layers are FORCED to quantize")
     ap.add_argument("--min-gemm", type=int, default=256,
@@ -226,13 +235,19 @@ def main():
                          "--no-quant-embeddings keeps them bf16.")
     ap.add_argument("--mseclip", action="store_true", help="MSE-optimal clip instead of absmax for the CONVROT linears only (embeddings always absmax) (~2-3%% lower weight error, but a proxy — validate output before trusting it)")
     ap.add_argument("--downcast-fp32", action="store_true", help="downcast stray fp32 passthrough linears to compute dtype")
-    ap.add_argument("--warn-thresh", type=float, default=2.0, help="warn on any quantized layer whose relerr%% exceeds this (default 2.0)")
+    ap.add_argument("--warn-thresh", type=float, default=None,
+                    help="warn on any quantized layer whose relerr%% exceeds this (default 2.0 for int8, "
+                         "4.0 for W6A8, 10.0 for W4A8: their normal weight error is ~2.4%% / ~7%%)")
     ap.add_argument("--verify-report", default=None, help="write the full per-layer (relerr, cos, gs) table to this path")
     args = ap.parse_args()
+    bits = 6 if args.w6a8 else 4
+    args.w4a8 = args.w4a8 or args.w6a8       # one grouped-int path below, parametrized by bits
+    if args.warn_thresh is None:
+        args.warn_thresh = {4: 10.0, 6: 4.0}[bits] if args.w4a8 else 2.0
     if not args.dst and not args.dry_run:
         # derive dst from src: swap dtype token for int8_convrot (else append), always .safetensors
         base = os.path.splitext(os.path.basename(args.src))[0]
-        tag = "w4a8_convrot" if args.w4a8 else "int8_convrot"
+        tag = f"w{bits}a8_convrot" if args.w4a8 else "int8_convrot"
         new = re.sub(r"(?i)(bf16|fp16|fp32)", tag, base)
         if new == base:
             new = base + "_" + tag
@@ -287,7 +302,7 @@ def main():
             qparams += shape[0] * shape[1]
         print(f"SRC {args.src}")
         print(f"compute/passthrough dtype: {target}")
-        fmt_label = ("W4A8+convrot (int8 fallback for K%256!=0 or N<64)" if args.w4a8
+        fmt_label = (f"W{bits}A8+convrot (int8 fallback for K%256!=0 or N<64)" if args.w4a8
                      else f"int8+convrot, {'MSE-clip' if args.mseclip else 'absmax'}")
         print(f"\nQUANTIZE {len(plan)} layers ({fmt_label}):")
         for pat in sorted(by_pat):
@@ -360,16 +375,16 @@ def main():
                 torch.cuda.empty_cache()
                 continue
             if base in quant_set and args.w4a8 and best_gs(w.shape[1]) == 256 and w.shape[0] >= 64:
-                tensors, cfg, relerr = quantize_w4a8(w)
+                tensors, cfg, relerr = quantize_w4a8(w, bits, args.group_size)
                 if relerr > args.warn_thresh:
-                    print(f"  WARN high error: {base} W4A8 relerr={relerr:.2f}%", flush=True)
+                    print(f"  WARN high error: {base} W{bits}A8 relerr={relerr:.2f}%", flush=True)
                 errs.append((relerr, 1.0, 256, base))
                 for suf, val in tensors.items():
                     out[f"{base}.{suf}"] = val
                 out[f"{base}.comfy_quant"] = torch.tensor(list(json.dumps(cfg).encode("utf-8")), dtype=torch.uint8)
                 nq += 1
                 if nq % 100 == 0:
-                    print(f"  {nq}/{len(plan)} ... {base} W4A8 relerr={relerr:.2f}%", flush=True)
+                    print(f"  {nq}/{len(plan)} ... {base} W{bits}A8 relerr={relerr:.2f}%", flush=True)
             elif base in quant_set:
                 gs = best_gs(w.shape[1])
                 qd, scale = quantize_convrot(w, gs, mseclip=args.mseclip)

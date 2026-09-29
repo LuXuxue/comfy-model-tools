@@ -36,10 +36,14 @@ Quantize (defaults: absmax, min-gemm 256)
 
 ```
 --dry-run — plan only (grouped quantize list + what's left behind, with reasons)
+--w4a8 — int4 weights + codebook + fp8 group scales, int8 activations
+--w6a8 — uniform int6 weights, ~3x lower weight error than W4A8 for 1.5x the bytes
+--group-size N — columns per fp8 group scale for --w4a8/--w6a8 (default 16 / 32). Smaller groups track
+    the weights more closely at cost of larger weights (8/N extra bits per weight), speed is unaffected.
 --exclude RE / --include RE — regex overrides on layer base names
 --min-gemm N — skip layers with min(N,K) < N (default 256)
 --mseclip — MSE-optimal clip instead of absmax, usually lower weight error, experimental
 --downcast-fp32 — shrink stray fp32 passthrough to the compute dtype
---warn-thresh F — warn on any quantized layer over F% relerr (default 2.0)
+--warn-thresh F — warn on any quantized layer over F% relerr (default 2.0; 4.0 for W6A8, 10.0 for W4A8)
 --verify-report PATH — dump the full per-layer (relerr, cos, gs) table
 ```
