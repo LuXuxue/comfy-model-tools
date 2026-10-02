@@ -120,20 +120,36 @@ DETECT_SENSITIVE = re.compile(
 
 # Detection = quantize every eligible 2-D block linear, minus a name denylist. No projection-name
 # allowlist (fragile: every arch invents new names like to_qkv/add_q_proj/single_blocks.linear1).
-# adaLN MODULATION *is* quantized (it's a big M=batch GEMM that quantizes cleanly ~0.9%, and on
-# Qwen/Flux it's 18-33% of the model — no reason to leave it bf16). We only exclude what's genuinely
-# not a per-token GEMM worth quantizing: scale_shift buffers, rope/pos_embed, input embedders,
-# gate/router logits, M=1 timestep MLPs, output head/final. 1-D norms are dropped by not-2d already.
+# The rule of thumb is M, not size: a layer whose GEMM is per-token (M = sequence length or the
+# spatial grid) averages its error down and quantizes cleanly; one driven by a per-sample
+# conditioning vector (M = batch, 1-4 at inference) gets no averaging, so its error lands
+# straight on the scale/shift or condition it feeds. Everything below is the M=batch kind:
+# scale_shift buffers, rope/pos_embed, input embedders, gate/router logits, M=1 timestep MLPs,
+# output head/final, adaLN MODULATION, and conditioning adapters. 1-D norms are dropped by
+# not-2d already.
 # Careful bits: `embedder` (not `embed`) keeps `*_embeddings_connector` in; bare `gate` stays
 # (SwiGLU) — only gate_logits/router drop; `timestep`/`time` catch the M=1 embed but not the modulator.
+# `adaln_modulation` (Anima) and `emb_layers` (SDXL) are the same adaLN path under two names;
+# `label_emb` (SDXL) is the pooled-CLIP projection, also M=batch. Their weight MSE really is fine
+# (~0.76-0.90%, measured) — excluding them is about the M=1 amplification, not the weight error.
+# Cost: 8.5% of Anima's 2-D weights, 1.0% of SDXL's.
+# Bare `modulation` (SD3/Flux/PixArt naming) is deliberately NOT listed: those archs are 18-33%
+# modulation and that is a much bigger, untested change — pass `--exclude modulation` if wanted.
+# NB this list is matched per path SEGMENT (classify), unlike --exclude which matches the full
+# key -- so multi-segment patterns like `blocks.0.` cannot live here; use --exclude for those.
 EXCLUDE_SEG = re.compile(
     r"scale_shift|rope|rotary|rel_pos|pos_?embed|embedder|"
     r"gate_logits|router|routing|logit|temperature|"
     r"(?:^|_)time|temb|t_emb|guidance|register|refiner_blocks|adapter|"
-    r"(?:^|_)(?:final|head|proj_out|out_layer)(?:_|$)")
+    r"(?:^|_)(?:final|head|proj_out|out_layer)(?:_|$)|"
+    r"adaln_modulation|emb_layers|label_emb")
 # `refiner_blocks` = short-M text side-path (Krea txtfusion.refiner_blocks); main-stream refiners are
 # `*_refiner` (Boogu/Z-Image), kept. `adapter` = conditioning injection modules (Wan-Animate
-# face_adapter, ip/control adapters): tiny, identity/quality-critical, quantize worst -> leave bf16.
+# face_adapter, Anima llm_adapter, ip/control adapters): tiny or M=short, identity/quality-critical,
+# quantize worst -> leave bf16. `proj_out` is here for the output head sense (Flux); note SDXL's
+# ResBlock `proj_in`/`proj_out` are ordinary per-token channel projections and this entry drops the
+# latter but not the former — an asymmetry inherited from earlier revisions, kept so behaviour on
+# already-converted models does not change.
 
 def classify(key, shape):
     """Quantize every eligible 2-D block linear except the name denylist. Returns (bool, reason)."""
