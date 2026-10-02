@@ -97,6 +97,27 @@ def open_model(path):
         return safe_open(path, framework="pt", device="cpu")
     return _TorchReader(path)
 
+# ComfyUI infers the architecture from tensor SHAPES (comfy/model_detection.py). int8 keeps
+# weight at [N, K] so shapes survive, but the PACKED formats store [N, K*bits/8], which
+# shrinks K and makes detect_unet_config mismatch, so the file is rejected with "no match
+# {...}" before a single layer loads. Two shapes matter on the UNet/DiT paths:
+#   context_dim      <- <first transformer block>.attn2.to_k.weight          (line 37)
+#   adm_in_channels  <- label_emb.0.0.weight / class_embedding.linear_1     (lines 1203, 1442)
+# A half-size read gives 1024 instead of 2048, and SDXL then refuses to match.
+#
+# The list is explicit (as comfy/model_detection.py itself is) rather than inferred from
+# repetition counts: `label_emb.0.0` and `label_emb.0.2` both normalize to `label_emb.N.N`,
+# so "how often does this path pattern occur" cannot separate them. Extend when a new
+# architecture lands.
+DETECT_SENSITIVE = re.compile(
+    r"attn2\.to_k$"                                     # context_dim
+    r"|(?:^|[._])label_emb(?:\.|$)"                      # adm_in_channels, num_classes
+    r"|class_embedding|add_embedding"                    # adm_in_channels
+    r"|x_embedder|img_in|input_proj|conv_in|latent_in"   # in/out channels, patch size, depth
+    r"|condition_proj|cond_in|cond_seq_linear"           # text/vec conditioning dims
+    r"|to_global_embed|to_timestep_embed|time_embedder"  # timestep / global cond dims
+    r"|input_embedder|vision_in")
+
 # Detection = quantize every eligible 2-D block linear, minus a name denylist. No projection-name
 # allowlist (fragile: every arch invents new names like to_qkv/add_q_proj/single_blocks.linear1).
 # adaLN MODULATION *is* quantized (it's a big M=batch GEMM that quantizes cleanly ~0.9%, and on
@@ -489,7 +510,8 @@ def main():
                 out[f"{base}.comfy_quant"] = torch.tensor(list(json.dumps(ecfg).encode("utf-8")), dtype=torch.uint8)
                 torch.cuda.empty_cache()
                 continue
-            if base in quant_set and args.w4a8 and best_gs(w.shape[1]) == 256 and w.shape[0] >= 64:
+            if (base in quant_set and args.w4a8 and best_gs(w.shape[1]) == 256 and w.shape[0] >= 64
+                    and not DETECT_SENSITIVE.search(base)):
                 tensors, cfg, relerr, err_base = quantize_w4a8(
                     w, bits, args.group_size, scale_search=args.scale_search)
                 gain = f" (fp8 scale search -{err_base - relerr:.3f}pp)" if relerr < err_base else ""
