@@ -11,9 +11,16 @@ DST optional: defaults to SRC with bf16/fp16/fp32 -> int8_convrot (or _int8_conv
 Auto-detect can't see token count M (small-M/windowed/audio layers get quantized anyway — size
 win, maybe not speed) or loader quirks (manual_cast/key-remap loaders -> loads but outputs garbage).
 So run --dry-run on an unfamiliar arch and use --min-gemm / --exclude as needed.
+
+Scale granularity is per-OUTPUT-CHANNEL everywhere (reduce over K -> [N,1]), for both int8 and
+W4A8 -- note the `int8_tensorwise` string in the comfy_quant config is comfy-kitchen's layout
+name, not "one scale for the tensor". A genuine single tensor-wide scale is ~8x worse (6.6% vs
+0.83% relerr), so there is nothing to gain there. W4A8 is finer still: rowwise fp32 s_channel
+times a per-group-of-16 fp8 s_rel.
 """
 # ruff: noqa: T201  (print() is this CLI's output)
 import argparse
+import dataclasses
 import json
 import os
 import re
@@ -167,26 +174,127 @@ def cq_tensor(gs):
     cfg = {"format": "int8_tensorwise", "convrot": True, "convrot_groupsize": gs}
     return torch.tensor(list(json.dumps(cfg).encode("utf-8")), dtype=torch.uint8)
 
+# ---------------------------------------------------------------------------
+# W4A8 fp8 group-scale refinement
+#
+# comfy-kitchen stores s_rel (the per-group relative scale) as fp8-e4m3: 3 mantissa bits,
+# so each group's scale carries ~6% relative error that nothing compensates for. It already
+# ships a fix -- pick, per group, the neighbouring fp8 value whose *decoded int8 levels* fit
+# the group best (`_search_group_scale`) -- but gates it on 6-bit only, so --w4a8 never gets
+# it. Re-enabling it at 4-bit cuts weight error ~1% at zero storage cost (the alternative,
+# fp32 s_rel, buys ~4% for +0.19 B/weight = a 33% size increase, so it is not worth it).
+#
+# The math below mirrors comfy-kitchen's eager path exactly, reimplemented locally so it does
+# not depend on private symbols: rotate in bf16 -> ALS codebook+group scale -> fp8 s_rel ->
+# nearest decoded level -> pick the best of 3 fp8 neighbours -> repack. Kept numerically
+# identical by construction (the candidate set is +-1 on the e4m3 bit pattern) and validated
+# against the private `_search_group_scale` in tests.
+# ---------------------------------------------------------------------------
+W4A8_E4M3_MAX = 0x7E          # 0x7F is NaN in e4m3fn
+W4A8_ROW_ELEMS = 1 << 22      # cap the fp32 working set per chunk (comfy-kitchen uses the same)
+
+def _w4a8_grid_levels(codebook, s_rel):
+    """int8 value each codebook level decodes to, per group: round(clamp(level * s_rel))."""
+    return (codebook.view(1, 1, -1) * s_rel.float().unsqueeze(-1)).round_().clamp_(-127, 127)
+
+def _w4a8_nearest(grouped, levels, target):
+    """Index of the nearest decoded level per element. `target` = grouped / s_channel."""
+    n, groups, gsize = grouped.shape
+    last = levels.shape[-1] - 1
+    lv = levels.reshape(n * groups, last + 1).contiguous()      # per-group sorted levels
+    tg = target.reshape(n * groups, gsize).contiguous()
+    pos = torch.searchsorted(lv, tg)
+    lo = (pos - 1).clamp(0, last)
+    hi = pos.clamp(0, last)
+    dlo = tg.sub(torch.gather(lv, 1, lo)).abs_()
+    dhi = tg.sub(torch.gather(lv, 1, hi)).abs_()
+    return torch.where(dhi < dlo, hi, lo).to(torch.int32).reshape(n, groups, gsize)
+
 @torch.no_grad()
-def quantize_w4a8(w, bits=4, group_size=None, device="cuda"):
+def _w4a8_search_scales(grouped, s_rel, s_channel, codebook):
+    """Per group, the fp8 neighbour of s_rel whose decoded levels minimize squared error."""
+    target = grouped / s_channel.view(-1, 1, 1)
+    raw = s_rel.view(torch.uint8)
+    cands = [s_rel.float(),
+             (raw - 1).clamp_(min=1).view(torch.float8_e4m3fn).float(),
+             (raw + 1).clamp_(max=W4A8_E4M3_MAX).view(torch.float8_e4m3fn).float()]
+    def score(c):
+        levels = _w4a8_grid_levels(codebook, c)
+        idx = _w4a8_nearest(grouped, levels, target)
+        err = torch.gather(levels, 2, idx.long()).sub_(target).pow_(2).sum(-1)
+        return c, err, idx
+    best_scale, best_err, best_idx = score(cands[0])
+    for c in cands[1:]:
+        c, err, idx = score(c)
+        better = err < best_err
+        torch.where(better, err, best_err, out=best_err)
+        torch.where(better, c, best_scale, out=best_scale)
+        torch.where(better.unsqueeze(-1), idx, best_idx, out=best_idx)
+    return best_scale.to(s_rel.dtype).contiguous(), best_idx
+
+def _w4a8_pack4(codes):
+    """int32 codes [N, K] -> int8 storage: two 4-bit codes per byte, even col in the low nibble."""
+    return ((codes[:, 0::2] & 0xF) | ((codes[:, 1::2] & 0xF) << 4)).to(torch.int8).contiguous()
+
+@torch.no_grad()
+def refine_w4a8_scales(p, wf, group_size, bits, convrot_groupsize=256):
+    """Re-pick the fp8 group scales of an existing W4A8 quantization by grid-aware search.
+    Returns (packed-weight, new-params), or None if the layout is not a searchable W4A8.
+
+    Chunked over rows so a large layer never materializes a full extra fp32 copy. Bits==6 is
+    already searched by comfy-kitchen, so it is left alone.
+    """
+    if bits != 4 or p.codebook is None or p.correction is not None:
+        return None
+    n, k = wf.shape
+    h = _build_hadamard(convrot_groupsize, device=wf.device, dtype=torch.bfloat16)
+    cb = p.codebook.float()
+    s_rel, s_channel = p.scale, p.s_channel
+    row = max(1, W4A8_ROW_ELEMS // max(k, 1))
+    packed, srels = [], []
+    for r0 in range(0, n, row):
+        # bf16 rotation + .float() matches rotate_int8_convrot_weight -> grouped_weight exactly
+        rot = _rotate_weight(wf[r0:r0 + row].contiguous(), h, convrot_groupsize)
+        grouped = rot.float().view(rot.shape[0], k // group_size, group_size)
+        sr, codes = _w4a8_search_scales(grouped, s_rel[r0:r0 + row], s_channel[r0:r0 + row], cb)
+        packed.append(_w4a8_pack4(codes.view(-1, k).to(torch.int32)))
+        srels.append(sr)
+        del rot, grouped
+    return torch.cat(packed), dataclasses.replace(p, scale=torch.cat(srels))
+
+@torch.no_grad()
+def quantize_w4a8(w, bits=4, group_size=None, device="cuda", scale_search=True):
     """W4A8: ConvRot-rotated int4 weight with a Lloyd-Max codebook + fp8 group
     scales, or with bits=6 W6A8: uniform int6, no codebook, ~3x lower weight error for
     1.5x the bytes. Activations quantize to int8 at runtime. Needs K divisible by 256 and N>=64.
-    Returns (out-tensor dict, comfy_quant cfg, relerr%)."""
+    `scale_search` re-picks the fp8 group scales by grid-aware search (~1% lower weight error at
+    4-bit, no size cost); it is already built into comfy-kitchen for 6-bit. Returns
+    (out-tensor dict, comfy_quant cfg, relerr%, relerr_before_search%)."""
     from comfy_kitchen.tensor import AsymW4A8Int8Layout, QuantizedTensor
     group_size = group_size or (32 if bits == 6 else 16)
     wf = w.to(device, torch.bfloat16)
     q, p = AsymW4A8Int8Layout.quantize(
         wf, group_size=group_size, convrot_groupsize=256,
         scale_dtype=torch.float8_e4m3fn, codebook=True, stochastic_rounding=0, bits=bits)
+    def relerr(qq, pp):
+        deq = QuantizedTensor(qq, "AsymW4A8Int8Layout", pp).dequantize().float()
+        return ((deq - wf.float()).norm() / wf.float().norm().clamp(min=1e-30)).item() * 100.0
+    err_base = relerr(q, p)
+    if scale_search:
+        # self-validating: keep the searched scales only if they actually dequantize better
+        r = refine_w4a8_scales(p, wf, group_size, bits)
+        if r is not None:
+            q2, p2 = r
+            if relerr(q2, p2) < err_base:
+                q, p = q2, p2
     deq = QuantizedTensor(q, "AsymW4A8Int8Layout", p).dequantize()
     tensors = {"weight": q.cpu(), "weight_s_rel": p.scale.cpu(), "weight_s_channel": p.s_channel.cpu()}
     if p.codebook is not None:
         tensors["weight_codebook"] = p.codebook.cpu()
     cfg = {"format": "w6a8_int8" if bits == 6 else "asym_w4a8_int8", "group_size": group_size,
            "convrot": True, "convrot_groupsize": 256}
-    relerr = ((deq.float() - wf.float()).norm() / wf.float().norm().clamp(min=1e-30)).item() * 100.0
-    return tensors, cfg, relerr
+    err = ((deq.float() - wf.float()).norm() / wf.float().norm().clamp(min=1e-30)).item() * 100.0
+    return tensors, cfg, err, err_base
 
 @torch.no_grad()
 def quantize_embedding(w, gs, device="cuda", chunk=32768):
@@ -224,6 +332,11 @@ def main():
                           "W4A8 at 0.78 vs 0.56 bytes/weight, same speed")
     ap.add_argument("--group-size", type=int, default=None,
                     help="columns per fp8 group scale for --w4a8/--w6a8 (default 16 for W4A8, 32 for W6A8)")
+    ap.add_argument("--scale-search", action=argparse.BooleanOptionalAction, default=True,
+                    help="re-pick the fp8 group scales of --w4a8 by grid-aware search: for each "
+                         "group take the neighbouring fp8 value whose decoded levels fit best "
+                         "(~1%% lower weight error, no size cost). comfy-kitchen only applies "
+                         "this at 6-bit, so it is done here for 4-bit. --no-scale-search to skip")
     ap.add_argument("--exclude", default=None, help="regex; matching layers are FORCED to passthrough")
     ap.add_argument("--include", default=None, help="regex; matching eligible layers are FORCED to quantize")
     ap.add_argument("--min-gemm", type=int, default=256,
@@ -302,7 +415,9 @@ def main():
             qparams += shape[0] * shape[1]
         print(f"SRC {args.src}")
         print(f"compute/passthrough dtype: {target}")
-        fmt_label = (f"W{bits}A8+convrot (int8 fallback for K%256!=0 or N<64)" if args.w4a8
+        fmt_label = (f"W{bits}A8+convrot" + ("" if bits == 6 else
+                                      f", fp8 scale-search {'on' if args.scale_search else 'off'}") +
+                      " (int8 fallback for K%256!=0 or N<64)" if args.w4a8
                      else f"int8+convrot, {'MSE-clip' if args.mseclip else 'absmax'}")
         print(f"\nQUANTIZE {len(plan)} layers ({fmt_label}):")
         for pat in sorted(by_pat):
@@ -375,16 +490,18 @@ def main():
                 torch.cuda.empty_cache()
                 continue
             if base in quant_set and args.w4a8 and best_gs(w.shape[1]) == 256 and w.shape[0] >= 64:
-                tensors, cfg, relerr = quantize_w4a8(w, bits, args.group_size)
+                tensors, cfg, relerr, err_base = quantize_w4a8(
+                    w, bits, args.group_size, scale_search=args.scale_search)
+                gain = f" (fp8 scale search -{err_base - relerr:.3f}pp)" if relerr < err_base else ""
                 if relerr > args.warn_thresh:
-                    print(f"  WARN high error: {base} W{bits}A8 relerr={relerr:.2f}%", flush=True)
+                    print(f"  WARN high error: {base} W{bits}A8 relerr={relerr:.2f}%{gain}", flush=True)
                 errs.append((relerr, 1.0, 256, base))
                 for suf, val in tensors.items():
                     out[f"{base}.{suf}"] = val
                 out[f"{base}.comfy_quant"] = torch.tensor(list(json.dumps(cfg).encode("utf-8")), dtype=torch.uint8)
                 nq += 1
                 if nq % 100 == 0:
-                    print(f"  {nq}/{len(plan)} ... {base} W{bits}A8 relerr={relerr:.2f}%", flush=True)
+                    print(f"  {nq}/{len(plan)} ... {base} W{bits}A8 relerr={relerr:.2f}%{gain}", flush=True)
             elif base in quant_set:
                 gs = best_gs(w.shape[1])
                 qd, scale = quantize_convrot(w, gs, mseclip=args.mseclip)
