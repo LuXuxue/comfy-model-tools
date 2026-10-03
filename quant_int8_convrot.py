@@ -136,13 +136,23 @@ DETECT_SENSITIVE = re.compile(
 # Bare `modulation` (SD3/Flux/PixArt naming) is deliberately NOT listed: those archs are 18-33%
 # modulation and that is a much bigger, untested change — pass `--exclude modulation` if wanted.
 # NB this list is matched per path SEGMENT (classify), unlike --exclude which matches the full
-# key -- so multi-segment patterns like `blocks.0.` cannot live here; use --exclude for those.
+# key -- so a pattern spanning two segments (`.layers.0.`) cannot live here. EXCLUDE_KEY below
+# is the full-key companion for exactly those.
 EXCLUDE_SEG = re.compile(
     r"scale_shift|rope|rotary|rel_pos|pos_?embed|embedder|"
     r"gate_logits|router|routing|logit|temperature|"
     r"(?:^|_)time|temb|t_emb|guidance|register|refiner_blocks|adapter|"
     r"(?:^|_)(?:final|head|proj_out|out_layer)(?:_|$)|"
     r"adaln_modulation|emb_layers|label_emb")
+# Cross-segment exclusions, matched against the whole key. `(?:^|\.)` on the left and `(?:\.|$)`
+# on the right mean `layers.0` cannot accidentally match `layers.10`/`layers.0x`, and no
+# diffusion arch uses a segment literally named `layers`, so SDXL/Anima are untouched.
+# The FIRST transformer/language layer: its input is the raw embedding output, before the
+# stack has normalized anything, so its activation statistics are unlike every other layer and
+# it is the one convert_to_quant's --qwen_vlm / --zimage filters also protect. 193-218M on the
+# Qwen3 text encoders here, ~2.5% of the file. NOT the last layer: that one is already covered
+# for text encoders by `lm_head` -> the `head` entry above.
+EXCLUDE_KEY = re.compile(r"(?:^|\.)layers\.0(?:\.|$)")
 # `refiner_blocks` = short-M text side-path (Krea txtfusion.refiner_blocks); main-stream refiners are
 # `*_refiner` (Boogu/Z-Image), kept. `adapter` = conditioning injection modules (Wan-Animate
 # face_adapter, Anima llm_adapter, ip/control adapters): tiny or M=short, identity/quality-critical,
@@ -166,8 +176,10 @@ def classify(key, shape):
     # integer is a Sequential index on a top-level MLP (tmlp.0, img_emb.proj.1) -> not a block.
     if not any(segs[i].isdigit() for i in range(len(segs) - 1)):
         return (False, "not-in-indexed-block")
+    if EXCLUDE_KEY.search(key):
+        return (False, "denylist(first layer: layers.0)")
     if any(EXCLUDE_SEG.search(s) for s in segs):
-        return (False, "denylist(scale_shift/embed/gate/time/head/refiner_blocks/adapter)")
+        return (False, "denylist(scale_shift/embed/gate/time/head/adaln/adapter)")
     return (True, f"gs{gs}")
 
 # ---------------------------------------------------------------------------
