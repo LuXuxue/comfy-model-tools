@@ -135,6 +135,20 @@ DETECT_SENSITIVE = re.compile(
 # Cost: 8.5% of Anima's 2-D weights, 1.0% of SDXL's.
 # Bare `modulation` (SD3/Flux/PixArt naming) is deliberately NOT listed: those archs are 18-33%
 # modulation and that is a much bigger, untested change — pass `--exclude modulation` if wanted.
+#
+# `visual` = a VLM vision tower inside a text encoder (Qwen3-VL / Qwen3.5). Unlike every other
+# entry this one is NOT about M: those GEMMs are per-patch and quantize cleanly by weight error
+# (0.87% mean on qwen3-vl-4b), but the tower's OUTPUT amplifies that 5.5x. Measured on one real
+# 768x768 image through ComfyUI's own preprocessing, fp16 source vs int8:
+#     deepstack taps   1.21% -> 1.97% -> 2.48%   (grows with depth — a plain ViT stack has no
+#                                                  per-block renormalisation to bound it, unlike
+#                                                  a UNet whose adaLN rescales every block)
+#     merged (LLM input)                  4.72%   cosine 0.99894
+# Re-running with the tower left in bf16 gives exactly 0.00%, so it accounts for 100% of the
+# vision-path error — which makes it worth the 200-280 MB that int8 would otherwise save.
+# Same conclusion convert_to_quant's --qwen_vlm reaches via `visual.`.
+# `mtp` = multi-token-prediction head, i.e. the lm_head pattern under another name; absent from
+# every checkpoint measured here, added for symmetry with the `head` entry above.
 # NB this list is matched per path SEGMENT (classify), unlike --exclude which matches the full
 # key -- so a pattern spanning two segments (`.layers.0.`) cannot live here. EXCLUDE_KEY below
 # is the full-key companion for exactly those.
@@ -143,7 +157,7 @@ EXCLUDE_SEG = re.compile(
     r"gate_logits|router|routing|logit|temperature|"
     r"(?:^|_)time|temb|t_emb|guidance|register|refiner_blocks|adapter|"
     r"(?:^|_)(?:final|head|proj_out|out_layer)(?:_|$)|"
-    r"adaln_modulation|emb_layers|label_emb")
+    r"adaln_modulation|emb_layers|label_emb|mtp|visual")
 # Cross-segment exclusions, matched against the whole key. `(?:^|\.)` on the left and `(?:\.|$)`
 # on the right mean `layers.0` cannot accidentally match `layers.10`/`layers.0x`, and no
 # diffusion arch uses a segment literally named `layers`, so SDXL/Anima are untouched.
