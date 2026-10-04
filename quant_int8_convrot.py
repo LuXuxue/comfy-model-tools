@@ -453,6 +453,31 @@ def quantize_embedding(w, gs, device="cuda", chunk=32768):
 # their [B,T,K] activations, so quantized text encoders run dequantized to bf16 and get storage
 # savings only, no speed.
 #
+# OWNERSHIP -- which loss belongs to what, and what would actually fix it.
+#
+#   weight 15.29%   quantization method (one scale per row). Ours to fix, and already fixed:
+#                   --w4a8 does the same 4-bit budget with a codebook and per-16 scales for 5.83%
+#                   at 7% more size. Not a bit-width problem: w4a8 is int4 too.
+#   activation 5.3% the kernel's absmax range, and it is a RUNTIME decision -- this script only
+#                   emits weights and config, so it cannot touch it. Quantizing real post-ConvRot
+#                   activations at 8 levels:
+#                       scheme                     SDXL UNet        Anima DiT
+#                       absmax clip (current)        14.372%           14.235%
+#                       MSE-optimal clip             11.068% 0.77x     11.412% 0.80x
+#                       Lloyd-Max codebook (ceiling)  9.147% 0.64x      9.659% 0.68x
+#                   So ~77-80% of it is the range being stretched by outliers, recoverable by
+#                   giving quantize_signed_int4_rowwise a clip ratio (CLIP_GRID above is the same
+#                   idea, and the weight side already does this via --mseclip). That is a small
+#                   comfy-kitchen kernel change and needs no ComfyUI change, since the config
+#                   contract does not change. The last ~15% needs a codebook, i.e. a changed
+#                   tensor contract, which does need ComfyUI (ops.py:1254 hardcodes
+#                   quant_group_size 64 and the tensor set is fixed).
+#   but even the ceiling is not enough. The trajectory amplifies by ~7x, so int4 activations land
+#   at roughly 24-29% final latent error even with a Lloyd-Max codebook, versus 2.17% for int8.
+#   Eight levels is simply not enough for a Gaussian; no PTQ placement fixes that. Usable 4-bit
+#   activations need SVDQuant's low-rank branch (proj_down/proj_up), which needs offline calibration
+#   and has no ComfyUI loader at all (no QUANT_ALGOS entry, no ops.py branch).
+#
 # Speed: unproven here. An int4 GEMM should run ~2x int8 where that is native. On RDNA3 a
 # single-shot run made int4 activations look slower (UNet 1024px batch 2, ms/iter: int8 3311,
 # w4a8 3304, w4a4/int8-acts 3782, w4a4/int4-acts 4152) but a 5-round interleaved A/B could not
