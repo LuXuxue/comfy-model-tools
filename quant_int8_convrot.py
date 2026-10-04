@@ -329,25 +329,34 @@ def refine_w4a8_scales(p, wf, group_size, bits, convrot_groupsize=256):
 W4A4_GROUP = 64        # int4 MMA kernel requires exactly this; not configurable
 
 @torch.no_grad()
-def quantize_w4a4(w, gs=None, device="cuda"):
-    """ConvRot W4A4: rotated int4 weight, one fp32 scale per row. 0.50 bytes/weight.
+def quantize_w4a4(w, gs=None, act_bits=8, device="cuda"):
+    """ConvRot W4A4 storage layout: rotated int4 weight, one fp32 scale per row, 0.50 B/weight.
 
-    EXPERIMENTAL -- the output is visibly degraded. Kept for measuring the format, not for use.
+    `act_bits` picks the ACTIVATION precision at inference via the config's `linear_dtype`
+    field, which is independent of the 4-bit weight:
+        act_bits=8 -> {"format": "convrot_w4a4", ..., "linear_dtype": "int8"}  (W4A8)
+        act_bits=4 -> no linear_dtype field, kernel quantizes activations to int4 (W4A4)
+    The weight bytes are identical either way; only `linear_dtype` differs. The published
+    `convrot_w4a4` checkpoints use int8 activations (see
+    diffusion_models/MinimaxH3/minimax_h3_fl2va_pruned_INT4BQ.safetensors, 117 of 200 layers).
 
-    Same 4-bit family as `--w4a8` but a different kernel (`convrot_w4a4`): uniform int4 with a
-    per-row scale instead of a Lloyd-Max codebook plus fp8 per-group-of-16 scales. The coarser
-    scale granularity is the problem, and `quant_group_size` cannot be tightened here because the
-    int4 MMA kernel requires exactly 64. Measured on SDXL (full model, 711 layers):
+    Measured on SDXL (711 layers, 5 prompt/seed samples per variant; weight error is identical for
+    both act_bits since the weights are byte-identical -- only the config differs):
 
-        int8 convrot + absmax   0.78% weight error   2.957 GB   ~20 dB end-to-end
-        w4a8 group16            ~5.8%                2.027 GB   15.3 dB
-        w4a4 group64           13.14%                1.933 GB   11.9 dB
+        format                size      weight err   PSNR mean (std)
+        int8 convrot          2.945 GB     0.78%       17.04 dB (1.88)
+        --w4a8                2.085 GB     5.83%       13.50 dB (1.41)
+        --w4a4 act_bits=8     1.933 GB    13.14%       13.01 dB (2.44)
+        --w4a4 act_bits=4     1.933 GB    13.14%       11.22 dB (1.65)
 
-    The 11.9 dB sample had a heavy magenta cast and blocky coloured noise. Note that ComfyUI's
-    `convrot_w4a4` layout carries no low-rank branch, so there is nothing to recover the ~13%
-    with -- that compensation is what `svdquant_w4a4` adds in comfy-kitchen, at the cost of
-    requiring offline calibration. The honest summary is that this format saves only ~4.6% over
-    `--w4a8` while roughly doubling the error, so the size win does not pay for the quality loss.
+    Read this as a size option, not an accuracy one: w4a4 is 7% smaller than w4a8 and about
+    equal to it, with 2.3x the weight error and much higher run-to-run spread.
+
+    `act_bits` is a real effect and is why the default is 8: switching to int4 activations lost
+    on 5 of 5 paired samples (-1.79 dB mean) and shifted mean image luminance by +17.2/255,
+    which is the magenta cast and coloured speckle visible in those samples. int8 activations
+    lose ~1.8 dB relative to that, not the ~4 dB a single sample suggested -- single-seed PSNR
+    on this model spans 9.4-16.2 dB for one variant and cannot rank formats on its own.
 
     Unlike w4a8 this path keeps `gs` per layer, so layers whose K is not a multiple of the
     convrot groupsize fall back to int8 rather than being forced to gs=256.
@@ -356,6 +365,8 @@ def quantize_w4a4(w, gs=None, device="cuda"):
     from comfy_kitchen.tensor.convrot_w4a4 import (
         dequantize_convrot_w4a4_weight, quantize_convrot_w4a4_weight)
     gs = gs or 256
+    if act_bits not in (4, 8):
+        raise ValueError(f"act_bits must be 4 or 8, got {act_bits}")
     wf = w.to(device, torch.float32)
     q, scale = quantize_convrot_w4a4_weight(
         wf, convrot_groupsize=gs, quant_group_size=W4A4_GROUP)
@@ -365,6 +376,8 @@ def quantize_w4a4(w, gs=None, device="cuda"):
     relerr = ((deq - wf).norm() / wf.norm().clamp(min=1e-30)).item() * 100.0
     tensors = {"weight": q.cpu(), "weight_scale": scale.cpu()}
     cfg = {"format": "convrot_w4a4", "convrot_groupsize": gs}
+    if act_bits == 8:
+        cfg["linear_dtype"] = "int8"
     return tensors, cfg, relerr, cos
 
 @torch.no_grad()
@@ -436,21 +449,28 @@ def main():
                      help="like --w4a8 but uniform 6-bit weights: ~3x lower weight error than "
                           "W4A8 at 0.78 vs 0.56 bytes/weight, same speed")
     fmt.add_argument("--w4a4", action="store_true",
-                     help="ConvRot W4A4: uniform int4, one fp32 scale per row, 0.50 B/weight. "
-                          "!! EXPERIMENTAL, OUTPUT IS VISIBLY DEGRADED -- end-to-end on SDXL "
-                          "this scored PSNR 11.9 dB with heavy colour cast and blocky coloured "
-                          "noise, versus ~20 dB for --w4a8 and the plain int8 path at ~0.8%% "
-                          "weight error. Weight error is 13.1%% mean, because the scale "
-                          "granularity is group-64 with no codebook (quant_group_size is fixed "
-                          "at 64 by the int4 MMA kernel, not tunable here) and ComfyUI's "
-                          "convrot_w4a4 layout has NO low-rank correction branch. It saves "
-                          "only ~4.6%% over --w4a8 (1.93 vs 2.03 GB on SDXL) while roughly "
-                          "doubling the error, so the size win does not pay for the quality "
-                          "loss. Use --w4a8 or --w6a8 unless you are measuring this format; "
-                          "for real 4-bit quality see svdquant_w4a4 in comfy-kitchen, which "
-                          "does carry the low-rank branch but needs offline calibration. "
-                          "Layers whose K is not a multiple of the convrot groupsize fall "
-                          "back to int8")
+                     help="ConvRot W4A4 storage layout: uniform int4 weight with one fp32 scale "
+                          "per row, 0.50 B/weight -- the smallest option here, 34%% smaller than "
+                          "int8 on SDXL (1.93 vs 2.95 GB) and 7%% smaller than --w4a8. Quality "
+                          "is about the SAME as --w4a8, not better: over 5 SDXL samples mean "
+                          "PSNR is 13.0 dB vs 13.5 dB for --w4a8 and 17.0 dB for int8, so treat "
+                          "it purely as a size option. Its weight error is much worse (13.1%% vs "
+                          "5.8%% vs 0.8%%) because the scale granularity is group-64 with no "
+                          "codebook and quant_group_size is pinned to 64 by the int4 MMA kernel, "
+                          "and it is less consistent (std 2.4 dB vs 1.4 dB). Activations are "
+                          "int8 by default (--w4a4-act-bits 8); passing 4 instead costs ~1.8 dB "
+                          "on every sample and adds a large global tone shift, so leave it. "
+                          "Prefer --w4a8 for a steadier result, --w6a8 if quality matters. For "
+                          "genuine 4-bit accuracy see svdquant_w4a4 in comfy-kitchen: it adds a "
+                          "low-rank branch but needs offline calibration and ComfyUI has no "
+                          "loader for it. Layers whose K is not a multiple of the convrot "
+                          "groupsize fall back to int8")
+    ap.add_argument("--w4a4-act-bits", type=int, choices=(4, 8), default=8,
+                    help="activation precision for --w4a4, set through the comfy_quant "
+                         "'linear_dtype' field (weight bytes are unaffected). 8 = int8 "
+                         "activations, which is what the published convrot_w4a4 checkpoints "
+                         "use and what you almost certainly want; 4 = int4 activations, the "
+                         "literal W4A4 reading, measured visibly degraded end to end")
     ap.add_argument("--group-size", type=int, default=None,
                     help="columns per fp8 group scale for --w4a8/--w6a8 (default 16 for W4A8, 32 for W6A8)")
     ap.add_argument("--scale-search", action=argparse.BooleanOptionalAction, default=True,
@@ -478,10 +498,10 @@ def main():
     args.w4a8 = args.w4a8 or args.w6a8       # one grouped-int path below, parametrized by bits
     if args.warn_thresh is None:
         args.warn_thresh = {4: 10.0, 6: 4.0}[bits] if args.w4a8 else (20.0 if args.w4a4 else 2.0)
-    if args.w4a4 and not args.dry_run:
-        print("!! --w4a4 is EXPERIMENTAL and the output is visibly degraded "
-              "(SDXL end-to-end PSNR 11.9 dB, heavy colour cast + blocky coloured noise). "
-              "It beats --w4a8 on size by only ~4.6%. Prefer --w4a8 or --w6a8.\n",
+    if args.w4a4 and args.w4a4_act_bits == 4 and not args.dry_run:
+        print("!! --w4a4-act-bits 4 quantizes ACTIVATIONS to int4, which loses ~1.8 dB on "
+              "every SDXL sample tested and shifts mean image luminance by +17/255 (the "
+              "magenta cast and coloured speckle). Drop this flag.\n",
               file=sys.stderr, flush=True)
     if not args.dst and not args.dry_run:
         # derive dst from src: swap dtype token for int8_convrot (else append), always .safetensors
@@ -541,8 +561,10 @@ def main():
             qparams += shape[0] * shape[1]
         print(f"SRC {args.src}")
         print(f"compute/passthrough dtype: {target}")
-        fmt_label = ("W4A4+convrot -- EXPERIMENTAL, visibly degraded (see --w4a4); "
-                     "int8 fallback when K is not a multiple of the convrot groupsize"
+        fmt_label = (f"W4A4+convrot, int{args.w4a4_act_bits} activations"
+                     + (" -- EXPERIMENTAL, visibly damaged (see --w4a4-act-bits)"
+                        if args.w4a4_act_bits == 4 else "")
+                     + "; int8 fallback when K is not a multiple of the convrot groupsize"
                      if args.w4a4 else
                      f"W{bits}A8+convrot" + ("" if bits == 6 else
                                       f", fp8 scale-search {'on' if args.scale_search else 'off'}") +
@@ -621,7 +643,7 @@ def main():
             gs4 = best_gs(w.shape[1]) if len(w.shape) == 2 else None
             if (base in quant_set and args.w4a4 and gs4 is not None
                     and not DETECT_SENSITIVE.search(base)):
-                tensors, cfg, relerr, cos = quantize_w4a4(w, gs4)
+                tensors, cfg, relerr, cos = quantize_w4a4(w, gs4, act_bits=args.w4a4_act_bits)
                 assert cos > 0.95, f"BROKEN quant (rotation/format?) {base} cos={cos:.5f} relerr={relerr:.2f}%"
                 if relerr > args.warn_thresh:
                     print(f"  WARN high error: {base} W4A4 relerr={relerr:.2f}%", flush=True)
