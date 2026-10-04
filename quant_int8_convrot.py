@@ -368,6 +368,26 @@ def quantize_w4a4(w, gs=None, device="cuda"):
     an int4 matmul should run at roughly twice the int8 rate where that is implemented natively,
     which the int8 branch forfeits by unpacking to a full int8 tensor on every forward.
 
+    Why the loss is large is structural, not a tuning problem, and it is not architecture-specific.
+    Measured on real activations, 300 linear layers each, weights held at int8 so only the
+    activation precision varies:
+
+                          SDXL UNet      Anima DiT
+        out err, int8 acts    0.837%         0.604%
+        out err, int4 acts   10.908%         8.142%
+        relative penalty    +1204%          +1248%
+        rotated act kurtosis  3.10            3.12    (3.0 = Gaussian)
+        mean |act| / 7        0.033           0.031   (1.0 = range fully used)
+
+    ConvRot exists to turn heavy-tailed activations Gaussian, and it succeeds: kurtosis ~3.1 in
+    both architectures. Uniform 8-level quantization is close to the worst possible fit for a
+    Gaussian (step-optimal uniform N=8 gives only ~4.9 dB SQNR), which is why the activations end
+    up using ~3% of the int4 range. The relative penalty is the same for a UNet and a DiT, so
+    adaLN modulation buys nothing here -- it controls magnitude going into the block, but ConvRot
+    re-mixes the row back to Gaussian immediately after. This is a quantizer/format mismatch, not
+    an architecture issue: the fix is a codebook or finer activation scales (what --w4a8 does), not
+    a different model.
+
     That payoff is NOT yet measurable on RDNA3. Single-shot timings suggested int4 activations were
     slower (UNet 1024px batch 2: int8 3311 ms, w4a8 3304, w4a4/int8-acts 3782, w4a4/int4-acts
     4152), but a 5-round interleaved A/B could not confirm it -- run-to-run drift on this box was
@@ -476,8 +496,12 @@ def main():
                           "keeps the weight packed and can use int4 throughput (the int8 branch "
                           "unpacks to a full int8 tensor every forward) -- but they cost a "
                           "further 1.79 dB against int8 activations of the same weights and shift "
-                          "mean image luminance +17/255. The speed side is a hypothesis, not a "
-                          "measured win: on RDNA3 a single-shot run made int4 activations look "
+                          "mean image luminance +17/255. That loss is structural: ConvRot makes "
+                          "activations Gaussian (kurtosis 3.10 SDXL / 3.12 Anima) and uniform 8-level "
+                          "quantization barely uses 3%% of its range, giving the same ~+1200%% "
+                          "relative penalty on a UNet and on a DiT alike. The speed side is a "
+                          "hypothesis, not a measured win: on RDNA3 a single-shot run made int4 "
+                          "activations look "
                           "slower (UNet 1024px batch 2: int8 3311ms, w4a8 3304, w4a4/int8 3782, "
                           "w4a4/int4 4152) but a 5-round interleaved A/B could not confirm it -- "
                           "drift was 78%% (3280->5825 ms) against a few-percent effect. Expect an "
