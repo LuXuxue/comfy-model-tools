@@ -330,73 +330,14 @@ W4A4_GROUP = 64        # int4 MMA kernel requires exactly this; not configurable
 
 @torch.no_grad()
 def quantize_w4a4(w, gs=None, device="cuda"):
-    """ConvRot W4A4 storage layout: rotated int4 weight, one fp32 scale per row, 0.50 B/weight.
+    """ConvRot W4A4: rotated int4 weight, one fp32 scale per output row, int4 activations.
+    0.50 bytes/weight. EXPERIMENTAL -- see W4A4_NOTES above for the measurements.
 
-    EXPERIMENTAL. Emits int4 activations as well as int4 weights: no `linear_dtype` key in the
-    comfy_quant config, which is what makes ComfyUI take the fused int4 path
-    (backends/hip/__init__.py:1452 -- packs activations to K/2 and runs the int4 GEMM against the
-    still-packed weight, with no per-forward unpack, versus unpacking to a full int8 tensor every
-    forward for the int8 branch). The published convrot_w4a4 checkpoints take the other branch:
-    diffusion_models/MinimaxH3/minimax_h3_fl2va_pruned_INT4BQ.safetensors sets linear_dtype "int8"
-    on 117 of its 200 layers. Add that key to this output to get the int8-activation variant.
+    No `linear_dtype` key is written, which is what selects int4 activations. Add
+    linear_dtype:"int8" to the config for the int8-activation variant of the same weights.
 
-    Why the weight error is 13.1% against w4a8's 5.8% at the same 4-bit budget: this keeps ONE
-    fp32 scale per output row for all K weights, w4a8 keeps an fp8 scale per group of 16 plus a
-    Lloyd-Max codebook. Decomposed on SDXL attn2.to_k [640,2048]:
-
-        per-row int4 + ConvRot                     15.21%
-        + per-16 scales instead (still uniform)     8.53%   <- the granularity difference
-        + Lloyd-Max codebook                        7.31%
-        + fp8 scale search (--scale-search)         7.20%
-
-    So ~85% of the gap is scale granularity and ~15% is the codebook. Note `quant_group_size=64`
-    is the int4 MMA kernel's K-tile requirement and has nothing to do with the scale granularity
-    -- the scales here are per-row (N,).
-
-    Measured on SDXL (711 layers, 5 prompt/seed samples per variant):
-
-        format                size      weight err   PSNR mean (std)
-        int8 convrot          2.945 GB     0.78%       17.04 dB (1.88)
-        --w4a8                2.085 GB     5.83%       13.50 dB (1.41)
-        --w4a4 int4 acts      1.933 GB    13.14%       11.22 dB (1.65)
-        --w4a4 int8 acts      1.933 GB    13.14%       13.01 dB (2.44)
-
-    The int4-activation choice is a deliberate trade: it loses 1.79 dB on 5 of 5 paired samples
-    against the int8-activation variant of the identical weights, and shifts mean image luminance
-    by +17.2/255 (the magenta cast and coloured speckle). It is chosen because the int4 kernel is
-    the only one of the two that keeps the weight packed and can exploit int4 GEMM throughput --
-    an int4 matmul should run at roughly twice the int8 rate where that is implemented natively,
-    which the int8 branch forfeits by unpacking to a full int8 tensor on every forward.
-
-    Why the loss is large is structural, not a tuning problem, and it is not architecture-specific.
-    Measured on real activations, 300 linear layers each, weights held at int8 so only the
-    activation precision varies:
-
-                          SDXL UNet      Anima DiT
-        out err, int8 acts    0.837%         0.604%
-        out err, int4 acts   10.908%         8.142%
-        relative penalty    +1204%          +1248%
-        rotated act kurtosis  3.10            3.12    (3.0 = Gaussian)
-        mean |act| / 7        0.033           0.031   (1.0 = range fully used)
-
-    ConvRot exists to turn heavy-tailed activations Gaussian, and it succeeds: kurtosis ~3.1 in
-    both architectures. Uniform 8-level quantization is close to the worst possible fit for a
-    Gaussian (step-optimal uniform N=8 gives only ~4.9 dB SQNR), which is why the activations end
-    up using ~3% of the int4 range. The relative penalty is the same for a UNet and a DiT, so
-    adaLN modulation buys nothing here -- it controls magnitude going into the block, but ConvRot
-    re-mixes the row back to Gaussian immediately after. This is a quantizer/format mismatch, not
-    an architecture issue: the fix is a codebook or finer activation scales (what --w4a8 does), not
-    a different model.
-
-    That payoff is NOT yet measurable on RDNA3. Single-shot timings suggested int4 activations were
-    slower (UNet 1024px batch 2: int8 3311 ms, w4a8 3304, w4a4/int8-acts 3782, w4a4/int4-acts
-    4152), but a 5-round interleaved A/B could not confirm it -- run-to-run drift on this box was
-    78% (3280 -> 5825 ms) against an effect of a few percent, and the early rounds actually favoured
-    int4. Treat the speed of this format as unmeasured here and re-measure on the target hardware
-    before relying on it. The quality cost above is solid; the speed benefit is the hypothesis.
-
-    Unlike w4a8 this path keeps `gs` per layer, so layers whose K is not a multiple of the
-    convrot groupsize fall back to int8 rather than being forced to gs=256.
+    Unlike quantize_w4a8 this keeps `gs` per layer, so a K that is not a multiple of 256 uses gs64
+    here instead of falling back to int8.
 
     Returns (out-tensor dict, comfy_quant cfg, relerr%, cosine)."""
     from comfy_kitchen.tensor.convrot_w4a4 import (
@@ -467,6 +408,58 @@ def quantize_embedding(w, gs, device="cuda", chunk=32768):
     return torch.cat(qs), torch.cat(ss)
 
 # ---------------------------------------------------------------------------
+# W4A4_NOTES -- why --w4a4 exists and why it is experimental. Kept here rather than in the
+# --help text, which should describe the interface, not the post-mortem.
+#
+# Format: rotated int4 weight, one fp32 scale per output row (not per group), int4 activations.
+# No linear_dtype key in the config -> ComfyUI takes the fused int4 branch
+# (backends/hip/__init__.py:1452), which packs activations to K/2 and reads the still-packed
+# weight. The int8 branch instead unpacks to a full int8 tensor every forward. Add
+# linear_dtype:"int8" to the config to get that variant instead.
+#
+# Size: 0.50 B/weight. On SDXL 1.93 GB vs 2.09 (--w4a8) and 2.95 (int8) -- only 7% under --w4a8.
+#
+# Weight error 13.1% vs --w4a8 5.8% and int8 0.8%. Cause is scale granularity, not the bit width:
+# one fp32 scale covers all K weights of a row, where --w4a8 has an fp8 scale per group of 16 plus
+# a Lloyd-Max codebook. On SDXL attn2.to_k [640,2048]:
+#     per-row int4 + ConvRot                   15.21%
+#     + per-16 scales (still uniform)           8.53%   <- granularity, 6.67pp of the gap
+#     + Lloyd-Max codebook                      7.31%
+#     + fp8 scale search (--scale-search)       7.20%
+# Note quant_group_size=64 is the int4 MMA kernel's K-tile requirement, not the scale granularity;
+# the scales are per-row (N,).
+#
+# Activations are the dominant cost and the reason this is experimental. Output error vs an fp
+# reference on real Anima activations (blocks.0 linears, w4a4 weights, only activation precision
+# varied): int8 activations 0.276%, int4 activations 5.300%.
+# Structural, not a tuning problem: ConvRot exists to Gaussianize activations and succeeds
+# (kurtosis 3.10 SDXL / 3.12 Anima), and uniform 8-level quantization is close to the worst fit for
+# a Gaussian (step-optimal uniform N=8 is only ~4.9 dB SQNR), so activations use ~3% of the int4
+# range. The relative penalty is the same ~+1200% on a UNet and a DiT, so adaLN buys nothing --
+# it controls magnitude entering the block, but ConvRot re-mixes the row back to Gaussian.
+# Not an architecture issue and not a kernel bug: the HIP int4 path is bit-identical to
+# backends/eager (verified, 0.000%), and the output is unbiased (regression slope 1.0016).
+# The fix is a codebook or finer activation scales, i.e. what --w4a8 already does.
+#
+# End to end. SDXL, 5 prompt/seed samples, PSNR mean: int8 17.04 dB, --w4a8 13.50, --w4a4 11.22.
+# Anima (video DiT, 280 layers, no int8 fallback so 15.29% weight error everywhere): final latent
+# relative error 2.17% for int8 vs 37.14% for --w4a4. Not anomalous divergence -- the trajectory
+# amplifies whatever error it is given by ~7-8x either way (int8 0.276% -> 2.17%, w4a4 5.30% ->
+# 37.14%); w4a4 simply hands it 19x more to start with.
+# Two bugs found along the way, both in comfy-kitchen rather than here: the eager
+# backends/eager/convrot_w4a4.py validates linear_dtype and then ignores it (always int4
+# activations), so it cannot serve as a reference for the int8 path; and ComfyUI's quantized
+# matmul is gated on input.dim()==2 (comfy/ops.py:1640), which text encoders never satisfy with
+# their [B,T,K] activations, so quantized text encoders run dequantized to bf16 and get storage
+# savings only, no speed.
+#
+# Speed: unproven here. An int4 GEMM should run ~2x int8 where that is native. On RDNA3 a
+# single-shot run made int4 activations look slower (UNet 1024px batch 2, ms/iter: int8 3311,
+# w4a8 3304, w4a4/int8-acts 3782, w4a4/int4-acts 4152) but a 5-round interleaved A/B could not
+# confirm it -- run-to-run drift was 78% (3280 -> 5825 ms) against a few-percent effect. Measure on
+# the target hardware. Note this is an iGPU and therefore compute-bound, which is why every format
+# sits near 1.2x and why the smaller file buys footprint, not speed, for the 4-bit formats.
+# ---------------------------------------------------------------------------
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("src")
@@ -482,33 +475,12 @@ def main():
                      help="like --w4a8 but uniform 6-bit weights: ~3x lower weight error than "
                           "W4A8 at 0.78 vs 0.56 bytes/weight, same speed")
     fmt.add_argument("--w4a4", action="store_true",
-                     help="EXPERIMENTAL. ConvRot W4A4: uniform int4 weight with one fp32 scale "
-                          "per row, plus int4 activations, 0.50 B/weight. Smallest option here, "
-                          "34%% smaller than int8 on SDXL (1.93 vs 2.95 GB). Weight error is "
-                          "much worse (13.1%% vs 5.8%% for --w4a8, 0.8%% for int8) because it "
-                          "keeps ONE fp32 scale per output row for all K weights and has no "
-                          "codebook, where --w4a8 carries an fp8 scale per group of 16 plus a "
-                          "Lloyd-Max codebook; that granularity difference alone is 15.2%% -> "
-                          "8.5%% of the 15.2%% -> 7.2%% gap. (quant_group_size=64 is only the int4 "
-                          "MMA kernel's K-tile requirement, not the scale granularity.) End to end "
-                          "on SDXL, 5 samples: 11.2 dB mean, vs 13.5 for --w4a8 and 17.0 for int8. "
-                          "The int4 activations are deliberate -- they are the only branch that "
-                          "keeps the weight packed and can use int4 throughput (the int8 branch "
-                          "unpacks to a full int8 tensor every forward) -- but they cost a "
-                          "further 1.79 dB against int8 activations of the same weights and shift "
-                          "mean image luminance +17/255. That loss is structural: ConvRot makes "
-                          "activations Gaussian (kurtosis 3.10 SDXL / 3.12 Anima) and uniform 8-level "
-                          "quantization barely uses 3%% of its range, giving the same ~+1200%% "
-                          "relative penalty on a UNet and on a DiT alike. The speed side is a "
-                          "hypothesis, not a measured win: on RDNA3 a single-shot run made int4 "
-                          "activations look "
-                          "slower (UNet 1024px batch 2: int8 3311ms, w4a8 3304, w4a4/int8 3782, "
-                          "w4a4/int4 4152) but a 5-round interleaved A/B could not confirm it -- "
-                          "drift was 78%% (3280->5825 ms) against a few-percent effect. Expect an "
-                          "int4 GEMM to run ~2x int8 where that is implemented natively; measure "
-                          "on your own hardware before relying on it. "
-                          "Prefer --w4a8 for quality, --w6a8 for a safer middle. Layers whose K "
-                          "is not a multiple of the convrot groupsize fall back to int8")
+                     help="EXPERIMENTAL, output is visibly degraded. ConvRot W4A4: uniform int4 "
+                          "weight, one fp32 scale per output row, int4 activations, 0.50 "
+                          "bytes/weight. Smallest option here (SDXL 1.93 GB vs int8 2.95) but "
+                          "much less accurate than --w4a8 -- measurements in the W4A4_NOTES "
+                          "comment in this file. Layers whose K is not a multiple of the convrot "
+                          "groupsize fall back to int8")
     ap.add_argument("--group-size", type=int, default=None,
                     help="columns per fp8 group scale for --w4a8/--w6a8 (default 16 for W4A8, 32 for W6A8)")
     ap.add_argument("--scale-search", action=argparse.BooleanOptionalAction, default=True,
@@ -525,7 +497,7 @@ def main():
                     help="quantize token-embedding tables (embed_tokens, embed_tokens_per_layer, ...) "
                          "per-ROW int8 (+rotation); ON by default (often the biggest size win). "
                          "--no-quant-embeddings keeps them bf16.")
-    ap.add_argument("--mseclip", action="store_true", help="MSE-optimal clip instead of absmax for the CONVROT linears only (embeddings always absmax) (~2-3%% lower weight error, but a proxy — validate output before trusting it)")
+    ap.add_argument("--mseclip", action="store_true", help="MSE-optimal clip instead of absmax for the CONVROT linears only (embeddings always absmax) (~2-3%% lower weight error, but a proxy -- validate output before trusting it)")
     ap.add_argument("--downcast-fp32", action="store_true", help="downcast stray fp32 passthrough linears to compute dtype")
     ap.add_argument("--warn-thresh", type=float, default=None,
                     help="warn on any quantized layer whose relerr%% exceeds this (default 2.0 for int8, "
