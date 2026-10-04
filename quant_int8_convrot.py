@@ -340,6 +340,19 @@ def quantize_w4a4(w, gs=None, act_bits=8, device="cuda"):
     `convrot_w4a4` checkpoints use int8 activations (see
     diffusion_models/MinimaxH3/minimax_h3_fl2va_pruned_INT4BQ.safetensors, 117 of 200 layers).
 
+    Why the weight error is 13.1% against w4a8's 5.8% at the same 4-bit budget: this keeps ONE
+    fp32 scale per output row for all K weights, w4a8 keeps an fp8 scale per group of 16 plus a
+    Lloyd-Max codebook. Decomposed on SDXL attn2.to_k [640,2048]:
+
+        per-row int4 + ConvRot                     15.21%
+        + per-16 scales instead (still uniform)     8.53%   <- the granularity difference
+        + Lloyd-Max codebook                        7.31%
+        + fp8 scale search (--scale-search)         7.20%
+
+    So ~85% of the gap is scale granularity and ~15% is the codebook. Note `quant_group_size=64`
+    is the int4 MMA kernel's K-tile requirement and has nothing to do with the scale granularity
+    -- the scales here are per-row (N,).
+
     Measured on SDXL (711 layers, 5 prompt/seed samples per variant; weight error is identical for
     both act_bits since the weights are byte-identical -- only the config differs):
 
@@ -348,6 +361,21 @@ def quantize_w4a4(w, gs=None, act_bits=8, device="cuda"):
         --w4a8                2.085 GB     5.83%       13.50 dB (1.41)
         --w4a4 act_bits=8     1.933 GB    13.14%       13.01 dB (2.44)
         --w4a4 act_bits=4     1.933 GB    13.14%       11.22 dB (1.65)
+
+    And speed, same box, UNet forward at 1024px batch 2 (this is an iGPU, so it is compute-bound
+    and weight size barely matters -- which is why every format sits near 1.2x):
+
+        format                size       ms/iter   vs fp16   peak VRAM
+        int8 convrot          2.945 GB     3232      1.24x     4378 MiB
+        --w4a8                2.085 GB     3278      1.22x     3522 MiB
+        --w4a4 act_bits=8     1.933 GB     3303      1.21x     3378 MiB
+        source fp16           5.135 GB     4012      1.00x     6501 MiB
+
+    The 4-bit formats are NOT faster than int8, and not faster than each other: on this backend
+    both unpack the int4 weight to int8 on every forward and then run the identical int8 WMMA
+    GEMM (backends/hip/__init__.py:1433 says so explicitly). The only thing the extra bit-width
+    buys is footprint. Plain int8 is simultaneously the fastest and by far the most accurate
+    here, so reach for a 4-bit format only when storage or VRAM is the binding constraint.
 
     Read this as a size option, not an accuracy one: w4a4 is 7% smaller than w4a8 and about
     equal to it, with 2.3x the weight error and much higher run-to-run spread.
@@ -455,9 +483,19 @@ def main():
                           "is about the SAME as --w4a8, not better: over 5 SDXL samples mean "
                           "PSNR is 13.0 dB vs 13.5 dB for --w4a8 and 17.0 dB for int8, so treat "
                           "it purely as a size option. Its weight error is much worse (13.1%% vs "
-                          "5.8%% vs 0.8%%) because the scale granularity is group-64 with no "
-                          "codebook and quant_group_size is pinned to 64 by the int4 MMA kernel, "
-                          "and it is less consistent (std 2.4 dB vs 1.4 dB). Activations are "
+                          "5.8%% vs 0.8%%) because it keeps ONE fp32 scale per output row covering "
+                          "all K weights and uses no codebook, where --w4a8 carries an fp8 scale "
+                          "per group of 16 plus a Lloyd-Max codebook; on a real SDXL layer that "
+                          "granularity difference alone is 15.2%% -> 8.5%% of the 15.2%% -> 7.2%% "
+                          "gap. (quant_group_size=64 is only the int4 MMA kernel's K-tile "
+                          "requirement, not the scale granularity.) It is also less consistent "
+                          "(std 2.4 dB vs 1.4 dB). IMPORTANT: the smaller file buys STORAGE AND "
+                          "VRAM, NOT SPEED. Measured on this backend both 4-bit formats unpack "
+                          "the int4 weight to int8 on every forward and run the same int8 WMMA "
+                          "GEMM, so w4a4 and w4a8 land within 0.8%% of each other (3303 vs 3278 "
+                          "ms/UNet at 1024px, batch 2) and neither is faster than plain int8 "
+                          "(3232 ms). Peak allocated VRAM does differ: w4a4 3378 MiB < w4a8 3522 "
+                          "< int8 4378 < fp16 6501. Activations are "
                           "int8 by default (--w4a4-act-bits 8); passing 4 instead costs ~1.8 dB "
                           "on every sample and adds a large global tone shift, so leave it. "
                           "Prefer --w4a8 for a steadier result, --w6a8 if quality matters. For "
